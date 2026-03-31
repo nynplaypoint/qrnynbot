@@ -6,7 +6,11 @@ from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 import barcode
 from barcode.writer import ImageWriter
 
-TOKEN = os.getenv("TOKEN") or "YOUR_BOT_TOKEN"
+# Get bot token from Railway environment variable
+TOKEN = os.getenv("TOKEN")  # set TOKEN in Railway
+
+if not TOKEN:
+    raise ValueError("Please set the TOKEN environment variable in Railway.")
 
 # ---------- QR GENERATOR ----------
 async def qr_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -49,5 +53,5 @@ app = ApplicationBuilder().token(TOKEN).build()
 app.add_handler(CommandHandler("qr", qr_command))
 app.add_handler(CommandHandler("bar", bar_command))
 
-print("Batch QR + Barcode Bot running...")
+print("Batch QR + Barcode Bot running on Railway...")
 app.run_polling()
