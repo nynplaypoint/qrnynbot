@@ -1,4 +1,4 @@
 python-telegram-bot
-qrcode
-pillow
+qrcode[pil]
 python-barcode
+Pillow
