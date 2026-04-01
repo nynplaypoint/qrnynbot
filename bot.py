@@ -1,28 +1,35 @@
 import os
+import hashlib
+from io import BytesIO
+
 import qrcode
-import barcode
-from barcode.writer import ImageWriter
 from qrcode.image.styledpil import StyledPilImage
 from qrcode.image.styles.moduledrawers import (
     RoundedModuleDrawer, CircleModuleDrawer, SquareModuleDrawer,
-    GappedSquareModuleDrawer, HorizontalBarsDrawer, VerticalBarsDrawer
+    GappedSquareModuleDrawer, HorizontalBarsDrawer, VerticalBarsDrawer,
 )
 from qrcode.image.styles.colormasks import SolidFillColorMask
-from io import BytesIO
+
+import barcode
+from barcode.writer import ImageWriter
+
 from PIL import Image
 import fpdf
+
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, MessageHandler,
-    CallbackQueryHandler, ContextTypes, ConversationHandler, filters
+    CallbackQueryHandler, ConversationHandler, ContextTypes, filters,
 )
 
 TOKEN = os.getenv("TOKEN")
 if not TOKEN:
     raise ValueError("TOKEN environment variable not set.")
 
+# ── conversation state ──────────────────────────────────────────────
 WAITING_LOGO = 1
 
+# ── style / color tables ────────────────────────────────────────────
 STYLES = {
     "square":  SquareModuleDrawer(),
     "rounded": RoundedModuleDrawer(),
@@ -32,43 +39,57 @@ STYLES = {
     "vbars":   VerticalBarsDrawer(),
 }
 
-COLOR_PRESETS = {
-    "classic": ("000000", "ffffff"),
-    "blue":    ("003f8f", "e8f0ff"),
-    "red":     ("8f0000", "fff0f0"),
-    "green":   ("006400", "f0fff0"),
-    "purple":  ("4b0082", "f5f0ff"),
-    "orange":  ("b35400", "fff5e8"),
-    "dark":    ("ffffff", "222222"),
-    "gold":    ("8b6914", "fffde8"),
+COLORS = {
+    "classic": ((0,0,0),       (255,255,255)),
+    "blue":    ((0,63,143),    (232,240,255)),
+    "red":     ((143,0,0),     (255,240,240)),
+    "green":   ((0,100,0),     (240,255,240)),
+    "purple":  ((75,0,130),    (245,240,255)),
+    "orange":  ((179,84,0),    (255,245,232)),
+    "dark":    ((255,255,255), (34,34,34)),
+    "gold":    ((139,105,20),  (255,253,232)),
 }
 
-qr_store = {}
+# ── in-memory text store ────────────────────────────────────────────
+store: dict[str, str] = {}
 
-
-def truncate(text: str, limit: int = 100) -> str:
-    return text if len(text) <= limit else text[:limit] + "..."
-
-
-def hex_to_rgb(h: str):
-    h = h.lstrip("#")
-    return tuple(int(h[i:i+2], 16) for i in (0, 2, 4))
-
-
-def store_text(text: str) -> str:
-    import hashlib
-    key = hashlib.md5(text.encode()).hexdigest()[:8]
-    qr_store[key] = text
+def save(text: str) -> str:
+    key = hashlib.md5(text.encode()).hexdigest()[:10]
+    store[key] = text
     return key
 
+def load(key: str) -> str:
+    return store.get(key, "")
 
-def make_qr_image(text: str, style="rounded", color_preset="classic", logo_bytes=None) -> BytesIO:
-    fg, bg = COLOR_PRESETS.get(color_preset, ("000000", "ffffff"))
-    fg_rgb = hex_to_rgb(fg) + (255,)
-    bg_rgb = hex_to_rgb(bg) + (255,)
+def cap(text: str, n: int = 100) -> str:
+    return text if len(text) <= n else text[:n] + "..."
 
-    drawer = STYLES.get(style, RoundedModuleDrawer())
-    color_mask = SolidFillColorMask(back_color=bg_rgb, front_color=fg_rgb)
+# ── QR builders ─────────────────────────────────────────────────────
+def build_qr_plain(text: str) -> BytesIO:
+    """Plain black-and-white QR, no styling library needed."""
+    qr = qrcode.QRCode(
+        version=None,
+        error_correction=qrcode.constants.ERROR_CORRECT_H,
+        box_size=12,
+        border=4,
+    )
+    qr.add_data(text)
+    qr.make(fit=True)
+    img = qr.make_image(fill_color="black", back_color="white")
+    bio = BytesIO()
+    bio.name = "qr.png"
+    img.save(bio, format="PNG")
+    bio.seek(0)
+    return bio
+
+
+def build_qr_styled(text: str, style: str, color: str, logo: BytesIO | None = None) -> BytesIO:
+    """Styled QR with optional logo."""
+    fg, bg = COLORS.get(color, COLORS["classic"])
+    fg_rgba = fg + (255,)
+    bg_rgba = bg + (255,)
+    mask = SolidFillColorMask(back_color=bg_rgba, front_color=fg_rgba)
+    drawer = STYLES.get(style, SquareModuleDrawer())
 
     qr = qrcode.QRCode(
         version=None,
@@ -82,20 +103,20 @@ def make_qr_image(text: str, style="rounded", color_preset="classic", logo_bytes
     img = qr.make_image(
         image_factory=StyledPilImage,
         module_drawer=drawer,
-        color_mask=color_mask,
+        color_mask=mask,
     ).convert("RGBA")
 
-    if logo_bytes:
-        logo = Image.open(logo_bytes).convert("RGBA")
-        qr_w, qr_h = img.size
-        logo_size = int(qr_w * 0.22)
-        logo = logo.resize((logo_size, logo_size), Image.LANCZOS)
+    if logo:
+        overlay = Image.open(logo).convert("RGBA")
+        qw, qh = img.size
+        sz = int(qw * 0.22)
+        overlay = overlay.resize((sz, sz), Image.LANCZOS)
         pad = 10
-        bg_block = Image.new("RGBA", (logo_size + pad * 2, logo_size + pad * 2), (255, 255, 255, 255))
-        pos_x = (qr_w - bg_block.width) // 2
-        pos_y = (qr_h - bg_block.height) // 2
-        img.paste(bg_block, (pos_x, pos_y))
-        img.paste(logo, (pos_x + pad, pos_y + pad), logo)
+        bg_block = Image.new("RGBA", (sz + pad*2, sz + pad*2), (255,255,255,255))
+        px = (qw - bg_block.width)  // 2
+        py = (qh - bg_block.height) // 2
+        img.paste(bg_block, (px, py))
+        img.paste(overlay, (px + pad, py + pad), overlay)
 
     bio = BytesIO()
     bio.name = "qr.png"
@@ -104,204 +125,187 @@ def make_qr_image(text: str, style="rounded", color_preset="classic", logo_bytes
     return bio
 
 
-def make_qr_pdf(text: str, style="rounded", color_preset="classic", logo_bytes=None) -> BytesIO:
+def build_pdf(text: str, style: str, color: str) -> BytesIO:
     import tempfile, os as _os
-    qr_bio = make_qr_image(text, style, color_preset, logo_bytes)
-    img = Image.open(qr_bio)
+    qr_bio = build_qr_styled(text, style, color)
+    pil = Image.open(qr_bio)
     tmp = BytesIO()
-    img.save(tmp, format="PNG")
+    pil.save(tmp, format="PNG")
     tmp.seek(0)
 
     with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
         f.write(tmp.read())
-        tmp_path = f.name
+        path = f.name
 
     pdf = fpdf.FPDF()
     pdf.add_page()
     pdf.set_font("Helvetica", size=12)
-    pdf.image(tmp_path, x=55, y=20, w=100)
-    _os.unlink(tmp_path)
-
-    caption = truncate(text, 120)
+    pdf.image(path, x=55, y=20, w=100)
+    _os.unlink(path)
     pdf.set_xy(10, 130)
-    pdf.multi_cell(0, 10, caption, align="C")
+    pdf.multi_cell(0, 10, cap(text, 120), align="C")
 
-    pdf_bytes = pdf.output(dest="S")
-    if isinstance(pdf_bytes, str):
-        pdf_bytes = pdf_bytes.encode("latin-1")
-
-    bio = BytesIO(pdf_bytes)
+    raw = pdf.output(dest="S")
+    if isinstance(raw, str):
+        raw = raw.encode("latin-1")
+    bio = BytesIO(raw)
     bio.name = "qr.pdf"
     bio.seek(0)
     return bio
 
-
-def style_keyboard():
+# ── keyboards ────────────────────────────────────────────────────────
+def kb_style():
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("◼ Square",  callback_data="style:square:classic"),
-            InlineKeyboardButton("● Rounded", callback_data="style:rounded:classic"),
-            InlineKeyboardButton("○ Circle",  callback_data="style:circle:classic"),
+            InlineKeyboardButton("◼ Square",  callback_data="ST:square"),
+            InlineKeyboardButton("● Rounded", callback_data="ST:rounded"),
+            InlineKeyboardButton("○ Circle",  callback_data="ST:circle"),
         ],
         [
-            InlineKeyboardButton("▦ Gapped",  callback_data="style:gapped:classic"),
-            InlineKeyboardButton("≡ H-Bars",  callback_data="style:hbars:classic"),
-            InlineKeyboardButton("║ V-Bars",  callback_data="style:vbars:classic"),
+            InlineKeyboardButton("▦ Gapped",  callback_data="ST:gapped"),
+            InlineKeyboardButton("≡ H-Bars",  callback_data="ST:hbars"),
+            InlineKeyboardButton("║ V-Bars",  callback_data="ST:vbars"),
         ],
     ])
 
-
-def color_keyboard(style: str):
+def kb_color(style: str):
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("⬛ Classic", callback_data=f"color:{style}:classic"),
-            InlineKeyboardButton("🔵 Blue",    callback_data=f"color:{style}:blue"),
-            InlineKeyboardButton("🔴 Red",     callback_data=f"color:{style}:red"),
-            InlineKeyboardButton("🟢 Green",   callback_data=f"color:{style}:green"),
+            InlineKeyboardButton("⬛ Classic", callback_data=f"CL:{style}:classic"),
+            InlineKeyboardButton("🔵 Blue",    callback_data=f"CL:{style}:blue"),
+            InlineKeyboardButton("🔴 Red",     callback_data=f"CL:{style}:red"),
+            InlineKeyboardButton("🟢 Green",   callback_data=f"CL:{style}:green"),
         ],
         [
-            InlineKeyboardButton("🟣 Purple",  callback_data=f"color:{style}:purple"),
-            InlineKeyboardButton("🟠 Orange",  callback_data=f"color:{style}:orange"),
-            InlineKeyboardButton("🌑 Dark",    callback_data=f"color:{style}:dark"),
-            InlineKeyboardButton("🟡 Gold",    callback_data=f"color:{style}:gold"),
+            InlineKeyboardButton("🟣 Purple",  callback_data=f"CL:{style}:purple"),
+            InlineKeyboardButton("🟠 Orange",  callback_data=f"CL:{style}:orange"),
+            InlineKeyboardButton("🌑 Dark",    callback_data=f"CL:{style}:dark"),
+            InlineKeyboardButton("🟡 Gold",    callback_data=f"CL:{style}:gold"),
         ],
     ])
 
-
-def action_keyboard(style: str, color: str, key: str):
+def kb_actions(style: str, color: str, key: str):
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("🖼 Add Logo", callback_data=f"logo:{style}:{color}:{key}"),
-            InlineKeyboardButton("📄 Get PDF",  callback_data=f"pdf:{style}:{color}:{key}"),
+            InlineKeyboardButton("🖼 Add Logo",     callback_data=f"LG:{style}:{color}:{key}"),
+            InlineKeyboardButton("📄 Get PDF",      callback_data=f"PD:{style}:{color}:{key}"),
         ],
         [
-            InlineKeyboardButton("🔄 Change Style", callback_data=f"restart:{key}"),
+            InlineKeyboardButton("🔄 Change Style", callback_data=f"RS:{key}"),
         ],
     ])
 
+# ── handlers ─────────────────────────────────────────────────────────
 
-# ---------- /start ----------
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 *QR & Barcode Bot*\n\n"
-        "Just *type any text* to generate a QR code!\n\n"
+        "Just type any text → instant QR code\n\n"
         "Commands:\n"
-        "/qr <text> — QR code with designer options\n"
-        "/bar <text> — Barcode\n"
-        "/bar t1 | t2 | t3 — Multiple barcodes\n\n"
-        "✨ Supports: styles, colors, logo overlay, PDF export",
-        parse_mode="Markdown"
+        "/qr <text> — plain QR\n"
+        "/qrc <text> — styled QR (colors + design)\n"
+        "/bar <text> — barcode\n"
+        "/bar t1 | t2 — multiple barcodes",
+        parse_mode="Markdown",
     )
 
 
-# ---------- plain text → QR ----------
-async def text_to_qr(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_qr(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Plain default QR."""
+    text = " ".join(context.args).strip()
+    if not text:
+        return await update.message.reply_text("Usage: /qr <text>")
+    bio = build_qr_plain(text)
+    await update.message.reply_photo(bio, caption=cap(text))
+
+
+async def cmd_qrc(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Styled QR — show style picker."""
+    text = " ".join(context.args).strip()
+    if not text:
+        return await update.message.reply_text("Usage: /qrc <text>")
+    save(text)
+    context.user_data["text"] = text
+    await update.message.reply_text("🎨 Pick a style:", reply_markup=kb_style())
+
+
+async def msg_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Any plain text → default black & white QR."""
     text = update.message.text.strip()
     if not text:
         return
-    store_text(text)
-    context.user_data["last_text"] = text
-    await update.message.reply_text(
-        "🎨 Pick a *style*:",
+    bio = build_qr_plain(text)
+    await update.message.reply_photo(bio, caption=cap(text))
+
+
+async def cb_style(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    style = q.data.split(":")[1]
+    await q.edit_message_text(
+        f"✅ Style: *{style}*\n\nPick a color:",
         parse_mode="Markdown",
-        reply_markup=style_keyboard()
+        reply_markup=kb_color(style),
     )
 
 
-# ---------- /qr ----------
-async def qr_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        return await update.message.reply_text("Usage: /qr <text>")
-    text = " ".join(context.args)
-    store_text(text)
-    context.user_data["last_text"] = text
-    await update.message.reply_text(
-        "🎨 Pick a *style*:",
-        parse_mode="Markdown",
-        reply_markup=style_keyboard()
-    )
-
-
-# ---------- callbacks ----------
-async def style_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    _, style, _ = query.data.split(":", 2)
-    await query.edit_message_text(
-        f"✅ Style: *{style}*\n\nNow pick a color:",
-        parse_mode="Markdown",
-        reply_markup=color_keyboard(style)
-    )
-
-
-async def color_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer("Generating...")
-    _, style, color = query.data.split(":", 2)
-
-    text = context.user_data.get("last_text", "")
+async def cb_color(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer("Generating...")
+    _, style, color = q.data.split(":")
+    text = context.user_data.get("text", "")
     if not text:
-        return await query.edit_message_text("❌ Text expired. Send your text again.")
-
-    key = store_text(text)
-    bio = make_qr_image(text, style, color)
-    await query.message.reply_photo(
-        bio,
-        caption=truncate(text),
-        reply_markup=action_keyboard(style, color, key)
-    )
-    await query.delete_message()
+        return await q.edit_message_text("❌ Session expired. Use /qrc <text> again.")
+    key = save(text)
+    bio = build_qr_styled(text, style, color)
+    await q.message.reply_photo(bio, caption=cap(text), reply_markup=kb_actions(style, color, key))
+    await q.delete_message()
 
 
-async def pdf_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer("Generating PDF...")
-    _, style, color, key = query.data.split(":", 3)
-    text = qr_store.get(key, "")
+async def cb_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer("Generating PDF...")
+    _, style, color, key = q.data.split(":", 3)
+    text = load(key)
     if not text:
-        return await query.message.reply_text("❌ Text expired. Send your text again.")
-    bio = make_qr_pdf(text, style, color)
-    await query.message.reply_document(bio, caption="📄 Your QR as PDF")
+        return await q.message.reply_text("❌ Session expired. Use /qrc <text> again.")
+    bio = build_pdf(text, style, color)
+    await q.message.reply_document(bio, caption="📄 QR as PDF")
 
 
-async def logo_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    _, style, color, key = query.data.split(":", 3)
+async def cb_logo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    _, style, color, key = q.data.split(":", 3)
     context.user_data["logo_style"] = style
     context.user_data["logo_color"] = color
     context.user_data["logo_key"]   = key
-    await query.message.reply_text("📎 Send your logo image (PNG, square recommended):")
+    await q.message.reply_text("📎 Send your logo image (PNG recommended):")
     return WAITING_LOGO
 
 
-async def restart_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    key = query.data.split(":", 1)[1]
-    text = qr_store.get(key, "")
+async def cb_restart(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    key = q.data.split(":", 1)[1]
+    text = load(key)
     if text:
-        context.user_data["last_text"] = text
-    await query.edit_message_text(
-        "🎨 Pick a *style*:",
-        parse_mode="Markdown",
-        reply_markup=style_keyboard()
-    )
+        context.user_data["text"] = text
+    await q.edit_message_text("🎨 Pick a style:", reply_markup=kb_style())
 
 
 async def logo_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    style = context.user_data.get("logo_style", "rounded")
+    style = context.user_data.get("logo_style", "square")
     color = context.user_data.get("logo_color", "classic")
     key   = context.user_data.get("logo_key", "")
-    text  = qr_store.get(key, "")
-
+    text  = load(key)
     if not text:
-        await update.message.reply_text("❌ Text expired. Send your text again.")
+        await update.message.reply_text("❌ Session expired. Use /qrc <text> again.")
         return ConversationHandler.END
 
     file_obj = (update.message.photo[-1] if update.message.photo else None) or update.message.document
     if not file_obj:
-        await update.message.reply_text("Please send an image.")
+        await update.message.reply_text("Please send an image file.")
         return WAITING_LOGO
 
     tg_file = await file_obj.get_file()
@@ -309,54 +313,51 @@ async def logo_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await tg_file.download_to_memory(logo_bio)
     logo_bio.seek(0)
 
-    bio = make_qr_image(text, style, color, logo_bytes=logo_bio)
-    await update.message.reply_photo(
-        bio,
-        caption=truncate(text),
-        reply_markup=action_keyboard(style, color, key)
-    )
+    bio = build_qr_styled(text, style, color, logo=logo_bio)
+    await update.message.reply_photo(bio, caption=cap(text), reply_markup=kb_actions(style, color, key))
     return ConversationHandler.END
 
 
-# ---------- /bar ----------
-async def bar_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_bar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         return await update.message.reply_text("Usage: /bar <text> or /bar t1 | t2 | t3")
-    raw = " ".join(context.args)
+    raw   = " ".join(context.args)
     items = [t.strip() for t in raw.split("|") if t.strip()]
-    await update.message.reply_text(f"Generating {len(items)} barcode(s)...")
+    if len(items) > 1:
+        await update.message.reply_text(f"Generating {len(items)} barcodes...")
     for text in items:
         try:
-            code128 = barcode.get("code128", text, writer=ImageWriter())
+            bc  = barcode.get("code128", text, writer=ImageWriter())
             bio = BytesIO()
             bio.name = "barcode.png"
-            code128.write(bio, options={"write_text": True})
+            bc.write(bio, options={"write_text": True})
             bio.seek(0)
-            await update.message.reply_photo(bio, caption=truncate(text))
+            await update.message.reply_photo(bio, caption=cap(text))
         except Exception as e:
             await update.message.reply_text(f"❌ Failed for '{text}': {e}")
 
 
-# ---------- main ----------
+# ── main ─────────────────────────────────────────────────────────────
 def main():
     app = ApplicationBuilder().token(TOKEN).build()
 
     logo_conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(logo_callback, pattern="^logo:")],
+        entry_points=[CallbackQueryHandler(cb_logo, pattern="^LG:")],
         states={WAITING_LOGO: [MessageHandler(filters.PHOTO | filters.Document.IMAGE, logo_received)]},
         fallbacks=[],
         per_message=False,
     )
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("qr", qr_command))
-    app.add_handler(CommandHandler("bar", bar_command))
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("qr",    cmd_qr))
+    app.add_handler(CommandHandler("qrc",   cmd_qrc))
+    app.add_handler(CommandHandler("bar",   cmd_bar))
     app.add_handler(logo_conv)
-    app.add_handler(CallbackQueryHandler(style_callback,   pattern="^style:"))
-    app.add_handler(CallbackQueryHandler(color_callback,   pattern="^color:"))
-    app.add_handler(CallbackQueryHandler(pdf_callback,     pattern="^pdf:"))
-    app.add_handler(CallbackQueryHandler(restart_callback, pattern="^restart:"))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_to_qr))
+    app.add_handler(CallbackQueryHandler(cb_style,   pattern="^ST:"))
+    app.add_handler(CallbackQueryHandler(cb_color,   pattern="^CL:"))
+    app.add_handler(CallbackQueryHandler(cb_pdf,     pattern="^PD:"))
+    app.add_handler(CallbackQueryHandler(cb_restart, pattern="^RS:"))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, msg_text))
 
     print("Bot running...")
     app.run_polling()
