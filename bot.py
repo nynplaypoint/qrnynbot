@@ -8,12 +8,11 @@ from qrcode.image.styles.moduledrawers import (
     RoundedModuleDrawer, CircleModuleDrawer, SquareModuleDrawer,
     GappedSquareModuleDrawer, HorizontalBarsDrawer, VerticalBarsDrawer,
 )
-from qrcode.image.styles.colormasks import SolidFillColorMask
 
 import barcode
 from barcode.writer import ImageWriter
 
-from PIL import Image
+from PIL import Image, ImageDraw
 import fpdf
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -26,10 +25,8 @@ TOKEN = os.getenv("TOKEN")
 if not TOKEN:
     raise ValueError("TOKEN environment variable not set.")
 
-# ── conversation state ──────────────────────────────────────────────
 WAITING_LOGO = 1
 
-# ── style / color tables ────────────────────────────────────────────
 STYLES = {
     "square":  SquareModuleDrawer(),
     "rounded": RoundedModuleDrawer(),
@@ -39,34 +36,54 @@ STYLES = {
     "vbars":   VerticalBarsDrawer(),
 }
 
+# fg, bg as hex strings
 COLORS = {
-    "classic": ((0,0,0),       (255,255,255)),
-    "blue":    ((0,63,143),    (232,240,255)),
-    "red":     ((143,0,0),     (255,240,240)),
-    "green":   ((0,100,0),     (240,255,240)),
-    "purple":  ((75,0,130),    (245,240,255)),
-    "orange":  ((179,84,0),    (255,245,232)),
-    "dark":    ((255,255,255), (34,34,34)),
-    "gold":    ((139,105,20),  (255,253,232)),
+    "classic": ("#000000", "#ffffff"),
+    "blue":    ("#003f8f", "#e8f0ff"),
+    "red":     ("#8f0000", "#fff0f0"),
+    "green":   ("#006400", "#f0fff0"),
+    "purple":  ("#4b0082", "#f5f0ff"),
+    "orange":  ("#b35400", "#fff5e8"),
+    "dark":    ("#ffffff", "#222222"),
+    "gold":    ("#8b6914", "#fffde8"),
 }
 
-# ── in-memory text store ────────────────────────────────────────────
 store: dict[str, str] = {}
+
 
 def save(text: str) -> str:
     key = hashlib.md5(text.encode()).hexdigest()[:10]
     store[key] = text
     return key
 
+
 def load(key: str) -> str:
     return store.get(key, "")
+
 
 def cap(text: str, n: int = 100) -> str:
     return text if len(text) <= n else text[:n] + "..."
 
-# ── QR builders ─────────────────────────────────────────────────────
+
+def colorize(img: Image.Image, fg_hex: str, bg_hex: str) -> Image.Image:
+    """Replace black pixels with fg color and white pixels with bg color."""
+    img = img.convert("RGB")
+    fg = tuple(int(fg_hex.lstrip("#")[i:i+2], 16) for i in (0, 2, 4))
+    bg = tuple(int(bg_hex.lstrip("#")[i:i+2], 16) for i in (0, 2, 4))
+    pixels = img.load()
+    w, h = img.size
+    for y in range(h):
+        for x in range(w):
+            r, g, b = pixels[x, y]
+            # dark pixel = module
+            if r < 128:
+                pixels[x, y] = fg
+            else:
+                pixels[x, y] = bg
+    return img
+
+
 def build_qr_plain(text: str) -> BytesIO:
-    """Plain black-and-white QR, no styling library needed."""
     qr = qrcode.QRCode(
         version=None,
         error_correction=qrcode.constants.ERROR_CORRECT_H,
@@ -84,11 +101,7 @@ def build_qr_plain(text: str) -> BytesIO:
 
 
 def build_qr_styled(text: str, style: str, color: str, logo: BytesIO | None = None) -> BytesIO:
-    """Styled QR with optional logo."""
-    fg, bg = COLORS.get(color, COLORS["classic"])
-    fg_rgba = fg + (255,)
-    bg_rgba = bg + (255,)
-    mask = SolidFillColorMask(back_color=bg_rgba, front_color=fg_rgba)
+    fg_hex, bg_hex = COLORS.get(color, ("#000000", "#ffffff"))
     drawer = STYLES.get(style, SquareModuleDrawer())
 
     qr = qrcode.QRCode(
@@ -100,23 +113,28 @@ def build_qr_styled(text: str, style: str, color: str, logo: BytesIO | None = No
     qr.add_data(text)
     qr.make(fit=True)
 
+    # Generate with shape style but plain black/white first
     img = qr.make_image(
         image_factory=StyledPilImage,
         module_drawer=drawer,
-        color_mask=mask,
-    ).convert("RGBA")
+    ).convert("RGB")
+
+    # Now recolor manually — this always works
+    img = colorize(img, fg_hex, bg_hex)
 
     if logo:
+        img_rgba = img.convert("RGBA")
         overlay = Image.open(logo).convert("RGBA")
-        qw, qh = img.size
+        qw, qh = img_rgba.size
         sz = int(qw * 0.22)
         overlay = overlay.resize((sz, sz), Image.LANCZOS)
         pad = 10
-        bg_block = Image.new("RGBA", (sz + pad*2, sz + pad*2), (255,255,255,255))
-        px = (qw - bg_block.width)  // 2
+        bg_block = Image.new("RGBA", (sz + pad*2, sz + pad*2), (255, 255, 255, 255))
+        px = (qw - bg_block.width) // 2
         py = (qh - bg_block.height) // 2
-        img.paste(bg_block, (px, py))
-        img.paste(overlay, (px + pad, py + pad), overlay)
+        img_rgba.paste(bg_block, (px, py))
+        img_rgba.paste(overlay, (px + pad, py + pad), overlay)
+        img = img_rgba.convert("RGB")
 
     bio = BytesIO()
     bio.name = "qr.png"
@@ -153,7 +171,7 @@ def build_pdf(text: str, style: str, color: str) -> BytesIO:
     bio.seek(0)
     return bio
 
-# ── keyboards ────────────────────────────────────────────────────────
+
 def kb_style():
     return InlineKeyboardMarkup([
         [
@@ -167,6 +185,7 @@ def kb_style():
             InlineKeyboardButton("║ V-Bars",  callback_data="ST:vbars"),
         ],
     ])
+
 
 def kb_color(style: str):
     return InlineKeyboardMarkup([
@@ -184,6 +203,7 @@ def kb_color(style: str):
         ],
     ])
 
+
 def kb_actions(style: str, color: str, key: str):
     return InlineKeyboardMarkup([
         [
@@ -195,15 +215,14 @@ def kb_actions(style: str, color: str, key: str):
         ],
     ])
 
-# ── handlers ─────────────────────────────────────────────────────────
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 *QR & Barcode Bot*\n\n"
-        "Just type any text → instant QR code\n\n"
+        "Just type any text → instant black & white QR\n\n"
         "Commands:\n"
         "/qr <text> — plain QR\n"
-        "/qrc <text> — styled QR (colors + design)\n"
+        "/qrc <text> — styled QR (pick shape + color)\n"
         "/bar <text> — barcode\n"
         "/bar t1 | t2 — multiple barcodes",
         parse_mode="Markdown",
@@ -211,7 +230,6 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_qr(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Plain default QR."""
     text = " ".join(context.args).strip()
     if not text:
         return await update.message.reply_text("Usage: /qr <text>")
@@ -220,7 +238,6 @@ async def cmd_qr(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_qrc(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Styled QR — show style picker."""
     text = " ".join(context.args).strip()
     if not text:
         return await update.message.reply_text("Usage: /qrc <text>")
@@ -230,7 +247,6 @@ async def cmd_qrc(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def msg_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Any plain text → default black & white QR."""
     text = update.message.text.strip()
     if not text:
         return
@@ -337,7 +353,6 @@ async def cmd_bar(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"❌ Failed for '{text}': {e}")
 
 
-# ── main ─────────────────────────────────────────────────────────────
 def main():
     app = ApplicationBuilder().token(TOKEN).build()
 
