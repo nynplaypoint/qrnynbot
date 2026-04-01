@@ -95,7 +95,7 @@ def qr_plain(text):
 def qr_styled(text, style, fg, bg, logo_b=None):
     dr = STYLES.get(style, SquareModuleDrawer())
     qr = qrcode.QRCode(error_correction=qrcode.constants.ERROR_CORRECT_H,
-                       box_size=12, border=4)
+                       box_size=30, border=4)
     qr.add_data(text); qr.make(fit=True)
     img = qr.make_image(image_factory=StyledPilImage,
                         module_drawer=dr).convert("RGB")
